@@ -7,6 +7,7 @@ import {
   PolylineIndex,
   smoothstep,
   smootherstep,
+  withinBounds,
 } from './math';
 import type {
   CorridorData,
@@ -15,7 +16,9 @@ import type {
   HeightFieldData,
   LevelSpec,
   MustReachRegion,
+  ReshapeBounds,
   SlopeHistogramBin,
+  TerrainDatum,
   Vec2,
 } from './types';
 
@@ -185,12 +188,30 @@ function gapHeight(x: number, z: number, gaps: GapDefinition[], fullHeight: numb
   return h;
 }
 
+export interface TerrainBuildOptions {
+  /**
+   * Replay onto an existing field. Heights outside `bounds` are never written, so already-confirmed
+   * ground stays bit-for-bit identical during a local reshape.
+   */
+  seedHeights?: Float32Array;
+  bounds?: ReshapeBounds | null;
+  /** Freeze the map datum and col sill so a local edit cannot lift or lower the whole mountain. */
+  freezeDatum?: boolean;
+  datum?: TerrainDatum;
+  /** Region labels whose landing pad must not be re-graded, with how far the map change reached each. */
+  padPreserved?: { labels: string[]; bounds: ReshapeBounds }[];
+}
+
+function inBounds(bounds: ReshapeBounds | null | undefined, x: number, z: number): boolean {
+  return !bounds || withinBounds(bounds.minX, bounds.maxX, bounds.minZ, bounds.maxZ, x, z);
+}
+
 /**
  * Cuts a shallow, monotone-descending trough along the authored river so the channel bed falls
  * from source to outlet. The bed is a monotone profile of the *path length* (not of terrain),
  * so the stream cannot climb and cannot pool in a high hollow; banks blend out over `width`.
  */
-function carveDrainageValley(field: HeightField, spec: LevelSpec): void {
+function carveDrainageValley(field: HeightField, spec: LevelSpec, bounds?: ReshapeBounds | null): void {
   const pts = spec.river.points;
   if (pts.length < 2) return;
   const path = resampleWaypoints(pts, Math.max(1.0, field.size / field.res * 0.8));
@@ -214,6 +235,7 @@ function carveDrainageValley(field: HeightField, spec: LevelSpec): void {
     const z = field.vertexZ(iz);
     for (let ix = 0; ix < n; ix++) {
       const x = field.vertexX(ix);
+      if (!inBounds(bounds, x, z)) continue;
       const hit = index.closest(x, z, 6);
       if (!hit || hit.distance > bankWidth) continue;
       const i = clamp(Math.round(hit.t), 0, path.length - 1);
@@ -235,11 +257,16 @@ export interface TerrainBuild {
   pads: PadDefinition[];
   regionTargets: Map<string, number>;
   padDistance: Float32Array;
+  datum: TerrainDatum;
 }
 
-export function buildBaseTerrain(spec: LevelSpec): TerrainBuild {
+export function buildBaseTerrain(spec: LevelSpec, options: TerrainBuildOptions = {}): TerrainBuild {
   const res = spec.resolution;
-  const field = new HeightField(spec.size, res);
+  const field = options.seedHeights
+    ? HeightField.from(spec.size, res, options.seedHeights)
+    : new HeightField(spec.size, res);
+  const bounds = options.bounds ?? null;
+  const padPreserved = options.padPreserved ?? [];
   const n = res + 1;
   const noise = makeNoise2D(spec.seed);
   const offset = { x: (spec.seed % 997) * 1.7 + 13.1, z: (spec.seed % 761) * 2.3 + 7.7 };
@@ -284,13 +311,13 @@ export function buildBaseTerrain(spec: LevelSpec): TerrainBuild {
   }
 
   const maxRidge = spec.ridges.reduce((m, r) => Math.max(m, r.height), 0);
-  const baseElev = 7 + maxRidge * 0.1;
+  const baseElev = options.freezeDatum && options.datum ? options.datum.baseElev : 7 + maxRidge * 0.1;
   const pr = spec.pass.radius;
   // The pass is a *col*: the ridge crest is lowered to a sill over a stretch of crest centred on
   // it, then climbs back to full height. Lowering the crest (rather than deleting the ridge)
   // keeps real relief across the crossing, so the saddle drains on both flanks instead of
   // becoming a flat plain that traps runoff.
-  const sill = maxRidge * 0.3;
+  const sill = options.freezeDatum && options.datum ? options.datum.sill : maxRidge * 0.3;
   const gaps: GapDefinition[] = [
     passGap(spec.pass.center, spec.ridges[0]?.points ?? [], pr * 1.0, pr * 2.5, sill),
   ];
@@ -304,6 +331,7 @@ export function buildBaseTerrain(spec: LevelSpec): TerrainBuild {
     const z = field.vertexZ(iz);
     for (let ix = 0; ix < n; ix++) {
       const x = field.vertexX(ix);
+      if (!inBounds(bounds, x, z)) continue;
       const i = iz * n + ix;
 
       const macro = noise.fbm(x * 0.0016 + offset.x, z * 0.0016 + offset.z, 4);
@@ -351,7 +379,7 @@ export function buildBaseTerrain(spec: LevelSpec): TerrainBuild {
   // A river needs a valley, not a plain that happens to be lower than its spring. Cut a shallow
   // trough down the authored channel so the bed descends continuously from the pass to the
   // outlet; without this the runoff simulation has nowhere physically coherent to drain.
-  carveDrainageValley(field, spec);
+  carveDrainageValley(field, spec, bounds);
 
   const pads: PadDefinition[] = [];
   const regionTargets = new Map<string, number>();
@@ -372,8 +400,16 @@ export function buildBaseTerrain(spec: LevelSpec): TerrainBuild {
 
   // Pads stay at their target height; aprons are cone-limited so the pad is reachable.
   for (const pad of pads) {
+    // A pad whose grading window lies wholly outside the patch is already part of the frozen
+    // ground; re-grading it would seed from the *ungraded* base and add a lip that was not in the
+    // confirmed map. Leave frozen pads exactly as they were.
+    if (bounds && !padTouchesBounds(bounds, pad, pad.kind === 'region' ? 24 : 16)) continue;
+    // A preserved region keeps its confirmed pad only if no authored change reached it. The pad body
+    // is restored *after* the pipeline (see `restorePreservedPads`, called from `buildState`), since
+    // the corridor bench runs over the lookout and would otherwise re-grade it.
+    if (pad.kind === 'region' && shouldRestorePreservedPad(pad, padPreserved ?? [])) continue;
     const reach = pad.kind === 'region' ? 24 : 16;
-    gradePadCone(field, pad.center, pad.radius, pad.height, spec.character.maxSlopeDeg * 0.92, reach);
+    gradePadCone(field, pad.center, pad.radius, pad.height, spec.character.maxSlopeDeg * 0.92, reach, bounds);
   }
 
   const base = field.clone();
@@ -385,7 +421,72 @@ export function buildBaseTerrain(spec: LevelSpec): TerrainBuild {
     pads,
     regionTargets,
     padDistance,
+    datum: { baseElev, sill },
   };
+}
+
+/**
+ * Restore a preserved region's confirmed bench inside the patch window, after every grading stage
+ * (base terrain, corridor bench) has run. The body keeps the exact heights the designer approved;
+ * nothing outside the pad body moves, so `mergeExterior` and the seed detail are unaffected.
+ */
+export function restorePreservedPads(
+  field: HeightField,
+  confirmed: Float32Array | null,
+  pads: PadDefinition[],
+  preserved: { labels: string[]; bounds: ReshapeBounds }[],
+): void {
+  if (!confirmed || confirmed.length !== field.heights.length || preserved.length === 0) return;
+  const n = field.vertexCount;
+  for (const pad of pads) {
+    if (pad.kind !== 'region') continue;
+    // Restore only a preserved pad the authored change did not reach: its label is listed and the
+    // change footprint does not overlap the pad body. A pad the change reached must be re-graded.
+    if (!shouldRestorePreservedPad(pad, preserved)) continue;
+    const r2 = pad.radius * pad.radius;
+    for (let iz = 0; iz < field.vertexCount; iz++) {
+      const dz = field.vertexZ(iz) - pad.center.z;
+      if (Math.abs(dz) > pad.radius) continue;
+      for (let ix = 0; ix < field.vertexCount; ix++) {
+        const dx = field.vertexX(ix) - pad.center.x;
+        if (dx * dx + dz * dz > r2) continue;
+        const idx = iz * n + ix;
+        field.heights[idx] = confirmed[idx];
+      }
+    }
+  }
+}
+
+function padTouchesBounds(bounds: ReshapeBounds, pad: PadDefinition, reach: number): boolean {
+  return boundingBoxesOverlap(bounds, {
+    minX: pad.center.x - pad.radius - reach,
+    maxX: pad.center.x + pad.radius + reach,
+    minZ: pad.center.z - pad.radius - reach,
+    maxZ: pad.center.z + pad.radius + reach,
+  });
+}
+
+/**
+ * A preserved region keeps its confirmed pad only if no authored change reached it. The change
+ * footprints (`bounds`) are compared against the pad body — not its grading apron — because a
+ * nearby edit that only raises the approach still needs the pad levelled onto the new approach.
+ */
+function shouldRestorePreservedPad(pad: PadDefinition, preserved: { labels: string[]; bounds: ReshapeBounds }[]): boolean {
+  for (const entry of preserved) {
+    if (!entry.labels.includes(pad.label ?? '')) continue;
+    const overlaps = boundingBoxesOverlap(entry.bounds, {
+      minX: pad.center.x - pad.radius,
+      maxX: pad.center.x + pad.radius,
+      minZ: pad.center.z - pad.radius,
+      maxZ: pad.center.z + pad.radius,
+    });
+    if (!overlaps) return true;
+  }
+  return false;
+}
+
+function boundingBoxesOverlap(a: ReshapeBounds, b: ReshapeBounds): boolean {
+  return !(a.minX > b.maxX || a.maxX < b.minX || a.minZ > b.maxZ || a.maxZ < b.minZ);
 }
 
 function averageHeight(field: HeightField, center: Vec2, radius: number): number {
@@ -410,6 +511,7 @@ export function gradePadCone(
   height: number,
   maxSlopeDeg: number,
   reach: number,
+  bounds?: ReshapeBounds | null,
 ): void {
   const n = field.vertexCount;
   const res = field.res;
@@ -422,7 +524,9 @@ export function gradePadCone(
   for (let iz = izMin; iz <= izMax; iz++) {
     const z = field.vertexZ(iz);
     for (let ix = ixMin; ix <= ixMax; ix++) {
-      const d = dist2(field.vertexX(ix), z, center.x, center.z);
+      const x = field.vertexX(ix);
+      if (!inBounds(bounds, x, z)) continue;
+      const d = dist2(x, z, center.x, center.z);
       if (d > outer) continue;
       const idx = iz * n + ix;
       if (d <= radius) {
@@ -482,7 +586,13 @@ export interface ErosionResult {
 }
 
 /** Water-driven incision that follows the river axis and undercuts the pass corridor. */
-export function erodeField(field: HeightField, spec: LevelSpec, amount: number, riverPoints: Vec2[]): ErosionResult {
+export function erodeField(
+  field: HeightField,
+  spec: LevelSpec,
+  amount: number,
+  riverPoints: Vec2[],
+  bounds?: ReshapeBounds | null,
+): ErosionResult {
   const out = field.clone();
   const incision = new Float32Array(out.heights.length);
   const a = clamp(amount, 0, 1);
@@ -500,6 +610,7 @@ export function erodeField(field: HeightField, spec: LevelSpec, amount: number, 
     for (let ix = 0; ix < n; ix++) {
       const x = out.vertexX(ix);
       if (Math.abs(x - center.x) > reach) continue;
+      if (!inBounds(bounds, x, z)) continue;
       const dPass = dist2(x, z, center.x, center.z);
       if (dPass > reach) continue;
       const dRiver = closestOnPolyline(x, z, river).distance;
@@ -525,6 +636,7 @@ export function fillPits(
   skipRadius: number,
   maxFill = 7,
   protectedRoute?: Vec2[],
+  bounds?: ReshapeBounds | null,
 ): number {
   const n = field.vertexCount;
   const res = field.res;
@@ -592,10 +704,17 @@ export function fillPits(
       const ni = nz * n + nx;
       if (visited[ni] || basinMask[ni] || keep[ni]) continue;
       visited[ni] = 1;
-      const spill = Math.max(filled[ni], level + 0.02);
-      if (spill - filled[ni] <= maxFill) {
-        if (spill > filled[ni]) raised++;
-        filled[ni] = spill;
+      // The flood always *propagates* through the whole field — stopping at the window edge would
+      // turn the frozen exterior into a wall and raise interior hollows that already drained. Only
+      // the height update is confined to the window, so the confirmed exterior stays bit-for-bit
+      // and the interior drains against it exactly as a fully-frozen map would.
+      const outside = !inBounds(bounds, field.vertexX(nx), field.vertexZ(nz));
+      if (!outside) {
+        const spill = Math.max(filled[ni], level + 0.02);
+        if (spill - filled[ni] <= maxFill) {
+          if (spill > filled[ni]) raised++;
+          filled[ni] = spill;
+        }
       }
       heap.push(ni, filled[ni]);
     }
@@ -668,6 +787,8 @@ export interface CorridorBuildOptions {
    */
   incision?: Float32Array | null;
   ravineDepth?: number;
+  /** Only vertices inside this window are re-graded; the rest of the field stays frozen. */
+  bounds?: ReshapeBounds | null;
 }
 
 export function buildCorridorOn(spec: LevelSpec, field: HeightField, opts: CorridorBuildOptions): CorridorData | null {
@@ -801,6 +922,7 @@ export function buildCorridorOn(spec: LevelSpec, field: HeightField, opts: Corri
     const z = field.vertexZ(iz);
     for (let ix = 0; ix < n; ix++) {
       const x = field.vertexX(ix);
+      if (!inBounds(opts.bounds, x, z)) continue;
       const hit = index.closest(x, z, 8);
       if (!hit || hit.distance > apronEnd) continue;
       const idx = iz * n + ix;

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { PolylineIndex } from '../core/math';
-import type { GenerationResult, Vec2 } from '../core/types';
+import type { GenerationResult, ReshapeReport, Vec2 } from '../core/types';
 
 export interface SelectionPoint {
   x: number;
@@ -10,6 +10,8 @@ export interface SelectionPoint {
 export interface SceneHandle {
   dispose(): void;
   setResult(result: GenerationResult): void;
+  /** Draw the patched/frozen block grid and work window of the latest local reshape. */
+  setReshapeOverlay(report: ReshapeReport | null): void;
   setWalkProgress(t: number): void;
   focusOn(point: Vec2): void;
   setCameraPreset(preset: 'overview' | 'trail' | 'regions'): void;
@@ -84,6 +86,7 @@ export function createScene(container: HTMLElement): SceneHandle {
   let character: THREE.Group | null = null;
   let overwriteGroup: THREE.Group | null = null;
   let regionGroup: THREE.Group | null = null;
+  let reshapeGroup: THREE.Group | null = null;
   let raf = 0;
   let progress = 0;
   let clockT = 0;
@@ -129,6 +132,7 @@ export function createScene(container: HTMLElement): SceneHandle {
     character = null;
     overwriteGroup = null;
     regionGroup = null;
+    reshapeGroup = null;
   }
 
   function buildTerrain(result: GenerationResult): THREE.Mesh {
@@ -463,6 +467,110 @@ export function createScene(container: HTMLElement): SceneHandle {
     return iz * (res + 1) + ix;
   }
 
+  /**
+   * Review overlay for a local reshape: one translucent quad per block inside the work window,
+   * amber where the window was patched and slate where it was left frozen, plus a bright frame
+   * around the window. This is what lets an author see *which* terrain layers moved.
+   */
+  function buildReshapeOverlay(report: ReshapeReport): THREE.Group {
+    const group = new THREE.Group();
+    if (!report.bounds || report.blocks.length === 0 || !result) return group;
+    const { field } = result;
+    const res = field.res;
+    const n = res + 1;
+    const cell = field.size / res;
+    const blockCell = Math.max(1, Math.round(res / Math.max(4, report.blockCount)));
+    const heightAt = (x: number, z: number): number => {
+      const ix = Math.max(0, Math.min(res, Math.round(((x + field.size / 2) / field.size) * res)));
+      const iz = Math.max(0, Math.min(res, Math.round(((z + field.size / 2) / field.size) * res)));
+      return field.heights[iz * n + ix] ?? 0;
+    };
+    const patched = new THREE.Color(0xffb347);
+    const frozen = new THREE.Color(0x3d6a8f);
+    const positions: number[] = [];
+    const colors: number[] = [];
+    const indices: number[] = [];
+    for (const b of report.blocks) {
+      const ix0 = b.bx * blockCell;
+      const iz0 = b.bz * blockCell;
+      const ix1 = Math.min(res, ix0 + blockCell);
+      const iz1 = Math.min(res, iz0 + blockCell);
+      if (ix1 <= ix0 || iz1 <= iz0) continue;
+      const x0 = -field.size / 2 + ix0 * cell;
+      const x1 = -field.size / 2 + ix1 * cell;
+      const z0 = -field.size / 2 + iz0 * cell;
+      const z1 = -field.size / 2 + iz1 * cell;
+      const c = b.mode === 'patched' ? patched : frozen;
+      const strength = b.mode === 'patched' ? Math.min(1, 0.28 + b.maxDelta * 0.05) : 0.14;
+      const base = positions.length / 3;
+      for (const [x, z] of [[x0, z0], [x1, z0], [x1, z1], [x0, z1]] as [number, number][]) {
+        positions.push(x, heightAt(x, z) + 0.35, z);
+        colors.push(c.r * strength, c.g * strength, c.b * strength);
+      }
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+    if (positions.length > 0) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      geo.setIndex(indices);
+      const mat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.42, side: THREE.DoubleSide, depthWrite: false });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.name = 'reshape-blocks';
+      mesh.renderOrder = 2;
+      group.add(mesh);
+    }
+
+    // Window frame. Lift it above the highest ground in the window so it stays visible.
+    const { minX, maxX, minZ, maxZ } = report.bounds;
+    let top = -Infinity;
+    for (let k = 0; k <= 24; k++) {
+      const t = k / 24;
+      top = Math.max(
+        top,
+        heightAt(minX + (maxX - minX) * t, minZ),
+        heightAt(minX + (maxX - minX) * t, maxZ),
+        heightAt(minX, minZ + (maxZ - minZ) * t),
+        heightAt(maxX, minZ + (maxZ - minZ) * t),
+      );
+    }
+    const y = top + 3.5;
+    const pts = [
+      new THREE.Vector3(minX, y, minZ),
+      new THREE.Vector3(maxX, y, minZ),
+      new THREE.Vector3(maxX, y, maxZ),
+      new THREE.Vector3(minX, y, maxZ),
+      new THREE.Vector3(minX, y, minZ),
+      new THREE.Vector3(maxX, y, minZ),
+    ];
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: report.rolledBack ? 0xff6b6b : 0x8ef0bd, transparent: true, opacity: 0.9 }),
+    );
+    line.renderOrder = 6;
+    group.add(line);
+    group.name = 'reshape';
+    return group;
+  }
+
+  function setReshapeOverlay(report: ReshapeReport | null): void {
+    if (reshapeGroup) {
+      root.remove(reshapeGroup);
+      reshapeGroup.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (mesh.geometry) mesh.geometry.dispose();
+        const mat = mesh.material as THREE.Material | THREE.Material[] | undefined;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else if (mat) mat.dispose();
+      });
+      reshapeGroup = null;
+    }
+    if (report && report.blocks.length > 0) {
+      reshapeGroup = buildReshapeOverlay(report);
+      root.add(reshapeGroup);
+    }
+  }
+
   function makeLabelSprite(text: string, color: string): THREE.Sprite {
     const canvas = document.createElement('canvas');
     canvas.width = 512;
@@ -531,6 +639,9 @@ export function createScene(container: HTMLElement): SceneHandle {
     if (terrain) pickMesh = terrain;
     character = buildCharacter();
     root.add(character);
+    // Local-reshape review overlay rides with the terrain it describes.
+    reshapeGroup = null;
+    setReshapeOverlay(next.reshape ?? null);
     setWalkProgress(0);
     // Frame the map.
     frameAll();
@@ -616,6 +727,7 @@ export function createScene(container: HTMLElement): SceneHandle {
   return {
     dispose,
     setResult,
+    setReshapeOverlay,
     setWalkProgress,
     focusOn,
     setCameraPreset,

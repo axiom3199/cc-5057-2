@@ -1,4 +1,4 @@
-import { clamp, closestOnPolyline, dist2, PolylineIndex } from './math';
+import { clamp, closestOnPolyline, dist2, PolylineIndex, withinBounds } from './math';
 import {
   HeightField,
   buildBaseTerrain,
@@ -9,6 +9,7 @@ import {
   estimatePassNetWidth,
   fillPits,
   heightStats,
+  restorePreservedPads,
   type PassWidth,
 } from './terrain';
 import { buildHydrology, reconnectDownstream, refreshWater, simulateRain, type Hydrology } from './hydrology';
@@ -25,6 +26,7 @@ import type {
   CorridorData,
   Evaluation,
   GenerationOptions,
+  GenerationRecipe,
   GenerationResult,
   LevelSpec,
   LevelStatus,
@@ -32,6 +34,8 @@ import type {
   RainResult,
   RepairCandidateReport,
   RepairKind,
+  ReshapeBounds,
+  TerrainDatum,
   Vec2,
 } from './types';
 
@@ -44,6 +48,36 @@ export interface Recipe {
   protectRiverbed: boolean;
   raisePass: boolean;
   routeKind: CorridorData['routeKind'];
+}
+
+export interface BuildStateOptions {
+  /**
+   * Seed the replay with this field instead of generating terrain from scratch. For a local
+   * reshape this is the previous confirmed field: inside the window it is regenerated in place,
+   * outside it stays exactly as seeded (and is re-asserted by `outerHeights` after the pipeline).
+   */
+  seedHeights?: Float32Array;
+  /** Limit terrain writes to this window (local reshape). */
+  bounds?: ReshapeBounds | null;
+  /** Reuse the datum/col sill of the map being patched. */
+  freezeDatum?: boolean;
+  datum?: TerrainDatum;
+  /**
+   * After the pipeline has rebuilt the window, copy these already-confirmed heights back outside
+   * it. This is what keeps explored, frozen terrain bit-for-bit identical.
+   */
+  outerHeights?: Float32Array;
+  /** Matching water state for the frozen exterior. */
+  outerHydrology?: Hydrology;
+  /** Region labels whose landing pad must not be re-graded, and the footprints that may touch them. */
+  padPreserved?: { labels: string[]; bounds: ReshapeBounds }[];
+  /**
+   * Footprint of the authored change itself (plus its grading reach). The boundary band is stitched
+   * only in the window *margin* outside this footprint: that margin is where untouched ground picked
+   * up global coupling, while inside the footprint the new solve is the authored result and must be
+   * left alone.
+   */
+  changeFootprint?: ReshapeBounds | null;
 }
 
 export interface StateBuild {
@@ -62,6 +96,27 @@ export interface StateBuild {
   evaluation: Evaluation;
   localSpec: LevelSpec;
   fordApplied: number;
+  datum: TerrainDatum;
+}
+
+export function recipeOf(recipe: Recipe): GenerationRecipe {
+  return {
+    riverPoints: recipe.riverPoints.map((p) => ({ ...p })),
+    route: recipe.route.map((p) => ({ ...p })),
+    protectRiverbed: recipe.protectRiverbed,
+    raisePass: recipe.raisePass,
+    routeKind: recipe.routeKind,
+  };
+}
+
+export function recipeFrom(recipe: GenerationRecipe): Recipe {
+  return {
+    riverPoints: recipe.riverPoints.map((p) => ({ ...p })),
+    route: recipe.route.map((p) => ({ ...p })),
+    protectRiverbed: recipe.protectRiverbed,
+    raisePass: recipe.raisePass,
+    routeKind: recipe.routeKind,
+  };
 }
 
 export function coarseResolution(spec: LevelSpec): number {
@@ -72,23 +127,31 @@ export function fineResolution(spec: LevelSpec): number {
   return Math.max(spec.resolution, Math.min(MAX_FINE_RES, Math.round(spec.resolution * 1.9)));
 }
 
-export function buildState(spec: LevelSpec, recipe: Recipe, res: number): StateBuild {
-  const terrain = buildBaseTerrain({ ...spec, resolution: res });
+export function buildState(spec: LevelSpec, recipe: Recipe, res: number, options: BuildStateOptions = {}): StateBuild {
+  const terrain = buildBaseTerrain({ ...spec, resolution: res }, {
+    seedHeights: options.seedHeights,
+    bounds: options.bounds,
+    freezeDatum: options.freezeDatum,
+    datum: options.datum,
+    padPreserved: options.padPreserved,
+  });
   let field = terrain.field;
   const base = terrain.base;
 
   let incision: Float32Array | null = null;
   if (spec.erosion > 0) {
-    const eroded = erodeField(field, spec, spec.erosion, recipe.riverPoints);
+    const eroded = erodeField(field, spec, spec.erosion, recipe.riverPoints, options.bounds);
     field = eroded.carved;
     incision = eroded.incision;
   }
   if (recipe.raisePass) {
-    raisePassSlope(field, spec);
-    recipe = { ...recipe, riverPoints: rerouteRiverBesidePass(field, spec, recipe.riverPoints) };
+    raisePassSlope(field, spec, options.bounds);
+    recipe = { ...recipe, riverPoints: rerouteRiverBesidePass(field, spec, recipe.riverPoints, options.bounds) };
   }
 
-  // Drain the incidental pits erosion leaves behind; authored basins remain sinks.
+  // Drain the incidental pits erosion leaves behind; authored basins remain sinks. Pit filling is
+  // a global flood, so it always runs over the whole field — restricting it to the window would
+  // turn the frozen exterior into a wall and raise interior hollows that already drained.
   fillPits(field, spec.basins, spec.pass.center, spec.pass.radius * 1.15);
   // Region target heights anchor feature scoring and landmark fidelity.
   const regionTargets = new Map<string, number>();
@@ -118,6 +181,7 @@ export function buildState(spec: LevelSpec, recipe: Recipe, res: number): StateB
     maxSlopeDeg: spec.character.maxSlopeDeg,
     incision: recipe.raisePass ? null : incision,
     ravineDepth: 1.6,
+    bounds: options.bounds,
   });
   if (corridor) corridor.routeKind = recipe.routeKind;
 
@@ -146,6 +210,22 @@ export function buildState(spec: LevelSpec, recipe: Recipe, res: number): StateB
     ) > 0
   ) {
     hydrology = refreshWater(field, hydrology, spec);
+  }
+
+  // Copy the already-confirmed exterior back so no frozen vertex or water cell drifts. The window
+  // was sized to contain every change, so anything outside it must be identical to before. If the
+  // previous field is at a different resolution we cannot honour "frozen exterior" at all, so
+  // refuse the patch rather than silently re-grading every frozen vertex.
+  if (options.outerHeights && options.bounds) {
+    if (options.outerHeights.length !== field.heights.length) {
+      throw new Error(
+        `local reshape needs the previous field at the same resolution (${previousResolution(options)}² vs ${field.res}²); regenerate the playable map first.`,
+      );
+    }
+    mergeExterior(field, hydrology, options.outerHeights, options.outerHydrology ?? null, options.bounds, options.changeFootprint ?? null);
+    // A preserved region keeps the exact bench the designer approved. Do this after every grading
+    // stage (the corridor bench runs over the lookout), and before nav/width so those read it.
+    restorePreservedPads(field, options.outerHeights, terrain.pads, options.padPreserved ?? []);
   }
 
   const passReference = corridor ? nearestPassSample(corridor, spec.pass.center) : spec.pass.center;
@@ -198,7 +278,81 @@ export function buildState(spec: LevelSpec, recipe: Recipe, res: number): StateB
     evaluation,
     localSpec,
     fordApplied,
+    datum: terrain.datum,
   };
+}
+
+function previousResolution(options: BuildStateOptions): string {
+  const len = options.outerHeights?.length ?? 0;
+  const res = Math.round(Math.sqrt(len)) - 1;
+  return Number.isFinite(res) && res > 0 ? String(res) : '?';
+}
+
+/** Restore frozen ground and water outside the patch window after the pipeline replays. */
+function mergeExterior(
+  field: HeightField,
+  hydrology: Hydrology,
+  outer: Float32Array,
+  outerHydrology: Hydrology | null,
+  bounds: ReshapeBounds,
+  changeFootprint: ReshapeBounds | null,
+): void {
+  const n = field.vertexCount;
+  if (outer.length !== field.heights.length) return;
+  for (let iz = 0; iz < n; iz++) {
+    const z = field.vertexZ(iz);
+    for (let ix = 0; ix < n; ix++) {
+      const x = field.vertexX(ix);
+      if (withinBounds(bounds.minX, bounds.maxX, bounds.minZ, bounds.maxZ, x, z)) continue;
+      field.heights[iz * n + ix] = outer[iz * n + ix];
+      if (outerHydrology) {
+        hydrology.water[iz * n + ix] = outerHydrology.water[iz * n + ix];
+        hydrology.depth[iz * n + ix] = outerHydrology.depth[iz * n + ix];
+        hydrology.surface[iz * n + ix] = outerHydrology.surface[iz * n + ix];
+        hydrology.connected[iz * n + ix] = outerHydrology.connected[iz * n + ix];
+      }
+    }
+  }
+  stitchBoundaryBand(field, outer, bounds, changeFootprint);
+}
+/**
+ * The interior replay runs the *global* pit-fill, so even ground the authored change never reaches
+ * can shift a metre or two where the new watershed differs from the old. The window is snapped out
+ * to whole blocks, which leaves a margin of just such untouched ground inside it; freezing the
+ * exterior right beside that margin would leave the shift as a step at the window edge.
+ *
+ * Recompute the boundary band: inside the first ring, keep the confirmed (pre-reshape) height so the
+ * join to the frozen exterior is exactly the step that was there before; ramp that correction to zero
+ * over the next few cells so the new solve resumes continuously. Only the margin is touched — the
+ * authored change lies deeper inside the window — and no exterior vertex moves.
+ */
+function stitchBoundaryBand(field: HeightField, outer: Float32Array, bounds: ReshapeBounds, changeFootprint: ReshapeBounds | null): void {
+  const n = field.vertexCount;
+  const res = field.res;
+  const cell = field.size / res;
+  const smooth = (t: number): number => t * t * (3 - 2 * t);
+  for (let iz = 0; iz < n; iz++) {
+    const z = field.vertexZ(iz);
+    for (let ix = 0; ix < n; ix++) {
+      const x = field.vertexX(ix);
+      if (!withinBounds(bounds.minX, bounds.maxX, bounds.minZ, bounds.maxZ, x, z)) continue;
+      // Never touch authored ground: inside the change footprint the replay *is* the design.
+      if (changeFootprint && withinBounds(changeFootprint.minX, changeFootprint.maxX, changeFootprint.minZ, changeFootprint.maxZ, x, z)) continue;
+      // Whole-cell rings from the window edge: 0 is the outermost inside vertex, which must meet
+      // the frozen exterior exactly, then the correction ramps to zero over `band` rings.
+      const edge = Math.min(x - bounds.minX, bounds.maxX - x, z - bounds.minZ, bounds.maxZ - z);
+      const ring = Math.max(0, Math.floor(edge / cell));
+      if (ring > 8) continue;
+      const idx = iz * n + ix;
+      const residual = Math.abs(outer[idx] - field.heights[idx]);
+      if (residual < 1e-3) continue;
+      // Enough rings that each step stays under ~25°; never so wide it reaches the authored change.
+      const band = Math.min(6, Math.max(1, Math.ceil(residual / (cell * Math.tan((25 * Math.PI) / 180)))));
+      if (ring >= band) continue;
+      const w = 1 - smooth(ring / band);
+      field.heights[idx] += (outer[idx] - field.heights[idx]) * w;
+    }
+  }
 }
 
 function nearestPassSample(corridor: CorridorData, p: Vec2): Vec2 {
@@ -275,7 +429,7 @@ function jointScore(
 }
 
 /** Fill the incised notch back into a coherent saddle while keeping the ridge shoulders. */
-export function raisePassSlope(field: HeightField, spec: LevelSpec): void {
+export function raisePassSlope(field: HeightField, spec: LevelSpec, bounds?: ReshapeBounds | null): void {
   const radius = spec.pass.radius * 2.0;
   const center = spec.pass.center;
   const n = field.vertexCount;
@@ -292,6 +446,7 @@ export function raisePassSlope(field: HeightField, spec: LevelSpec): void {
     if (Math.abs(z - center.z) > radius) continue;
     for (let ix = 0; ix < n; ix++) {
       const x = field.vertexX(ix);
+      if (!inBoundsLocal(bounds, x, z)) continue;
       const d = dist2(x, z, center.x, center.z);
       if (d > radius) continue;
       const w = 1 - smoothstep01(radius * 0.2, radius, d);
@@ -303,7 +458,12 @@ export function raisePassSlope(field: HeightField, spec: LevelSpec): void {
 }
 
 /** Shift the reach near the pass sideways so the corridor can occupy the old pass centre. */
-export function rerouteRiverBesidePass(field: HeightField, spec: LevelSpec, riverPoints: Vec2[]): Vec2[] {
+export function rerouteRiverBesidePass(
+  field: HeightField,
+  spec: LevelSpec,
+  riverPoints: Vec2[],
+  bounds?: ReshapeBounds | null,
+): Vec2[] {
   if (riverPoints.length < 2) return riverPoints;
   const center = spec.pass.center;
   const reach = spec.pass.radius * 2.4;
@@ -327,10 +487,14 @@ export function rerouteRiverBesidePass(field: HeightField, spec: LevelSpec, rive
   }
   return riverPoints.map((p) => {
     const d = dist2(p.x, p.z, center.x, center.z);
-    if (d > reach) return { ...p };
+    if (d > reach || !inBoundsLocal(bounds, p.x, p.z)) return { ...p };
     const w = 1 - smoothstep01(spec.pass.radius * 0.4, reach, d);
     return { x: p.x + normal.x * offset * bestSign * w, z: p.z + normal.z * offset * bestSign * w };
   });
+}
+
+function inBoundsLocal(bounds: ReshapeBounds | null | undefined, x: number, z: number): boolean {
+  return !bounds || withinBounds(bounds.minX, bounds.maxX, bounds.minZ, bounds.maxZ, x, z);
 }
 
 function riverTangentAt(points: Vec2[], at: Vec2): Vec2 {
@@ -677,10 +841,12 @@ function rollbackResult(
     passCenter: previous.passCenter,
     locks: spec.locks,
     snapshotLabel: previous.label,
+    recipe: previous.recipe,
+    datum: previous.datum,
   };
 }
 
-function assembleResult(
+export function assembleResult(
   spec: LevelSpec,
   build: StateBuild,
   recipe: Recipe,
@@ -732,6 +898,10 @@ function assembleResult(
     baseField: build.base.heights.slice(),
     passCenter: recipe.route.length > 0 ? spec.pass.center : spec.pass.center,
     locks: spec.locks,
+    recipe: recipeOf(recipe),
+    datum: build.datum,
+    hydrology: build.hydrology,
+    reshape: null,
   };
 }
 
@@ -768,6 +938,9 @@ export function toSnapshot(result: GenerationResult, label: string): PlayableSna
     baseField: result.baseField,
     passCenter: result.passCenter,
     passWidth: result.passWidth,
+    recipe: result.recipe,
+    datum: result.datum,
+    hydrology: result.hydrology,
   };
 }
 

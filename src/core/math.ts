@@ -8,6 +8,23 @@ export const clamp = (v: number, lo: number, hi: number): number =>
 
 export const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 
+/**
+ * Tolerance for testing whether a grid vertex lies inside a reshape window. A vertex computed at
+ * the window plane can land a few ulps either side depending on how its coordinate is derived, so
+ * a single authoritative helper (with this epsilon) keeps the pipeline, the exterior merge and the
+ * seam audit in agreement about which vertices are "inside".
+ */
+export const BOUNDS_EPS = 1e-6;
+
+export const withinBounds = (
+  minX: number,
+  maxX: number,
+  minZ: number,
+  maxZ: number,
+  x: number,
+  z: number,
+): boolean => x >= minX - BOUNDS_EPS && x <= maxX + BOUNDS_EPS && z >= minZ - BOUNDS_EPS && z <= maxZ + BOUNDS_EPS;
+
 export const smoothstep = (edge0: number, edge1: number, x: number): number => {
   if (edge0 === edge1) return x < edge0 ? 0 : 1;
   const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);

@@ -106,6 +106,142 @@ export interface HeightFieldData {
   heights: Float32Array;
 }
 
+export interface TerrainDatum {
+  /** Datum added to the whole map; frozen during local reshapes so distant ground keeps its level. */
+  baseElev: number;
+  /** Ridge contribution at a col; frozen alongside the datum. */
+  sill: number;
+}
+
+/** The exact pipeline inputs a level was generated with, so a local reshape can replay it. */
+export interface GenerationRecipe {
+  riverPoints: Vec2[];
+  route: Vec2[];
+  protectRiverbed: boolean;
+  raisePass: boolean;
+  routeKind: 'initial' | 'rerouted' | 'restored';
+}
+
+export interface ReshapeBounds {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
+
+export interface ReshapeBlockReport {
+  bx: number;
+  bz: number;
+  changedCells: number;
+  totalCells: number;
+  maxDelta: number;
+  mode: 'patched' | 'frozen';
+}
+
+export interface SeamReport {
+  boundaryCells: number;
+  maxStep: number;
+  meanStep: number;
+  maxSlopeDeg: number;
+  /** Agreement between the fine and coarse edit deltas (multi-scale consistency). */
+  lodDeltaAgreement: number;
+  ok: boolean;
+}
+
+export interface AdjustableRange {
+  parameter: 'editScale' | 'corridorWidth' | 'ridgeOffset' | 'ridgeHeight' | 'passRadius';
+  label: string;
+  min: number;
+  max: number;
+  current: number;
+  suggested: number;
+  unit: string;
+  note: string;
+}
+
+export interface ReshapeConflict {
+  id: string;
+  kind: 'unreachable-region' | 'no-ramp' | 'seam' | 'lod' | 'locked';
+  label: string;
+  detail: string;
+  adjustable: AdjustableRange[];
+}
+
+export interface ReshapeRouteDiff {
+  regionId: string;
+  name: string;
+  reachedBefore: boolean;
+  reachedAfter: boolean;
+  maxGradeBefore: number;
+  maxGradeAfter: number;
+  lengthBefore: number;
+  lengthAfter: number;
+  changed: boolean;
+}
+
+export interface ReshapeControlReport {
+  status: LevelStatus;
+  maxGrade: number;
+  minNetWidth: number;
+  maxFieldDelta: number;
+  meanFieldDelta: number;
+  elapsedMs: number;
+}
+
+export interface ReshapeReport {
+  label: string;
+  mode: 'local' | 'rolled-back';
+  bounds: ReshapeBounds | null;
+  blocks: ReshapeBlockReport[];
+  blockCount: number;
+  patchedCells: number;
+  frozenCells: number;
+  totalCells: number;
+  affected: {
+    ridges: string[];
+    basins: string[];
+    regions: string[];
+    river: boolean;
+    corridor: boolean;
+    pass: boolean;
+    hydrology: boolean;
+    navigation: boolean;
+  };
+  routes: ReshapeRouteDiff[];
+  corridorRoute: {
+    changed: boolean;
+    maxGradeBefore: number;
+    maxGradeAfter: number;
+    minWidthBefore: number;
+    minWidthAfter: number;
+  };
+  seam: SeamReport;
+  lod: { coarseRes: number; fineRes: number; deltaAgreement: number; finalAgreement: number };
+  coarseGate: { accepted: boolean; reasons: string[] };
+  fineGate: { accepted: boolean; reasons: string[] };
+  conflicts: ReshapeConflict[];
+  rolledBack: boolean;
+  elapsedMs: number;
+  patchMs: number;
+  navigation: { field: 'fine'; res: number; corridorWalkSuccess: boolean; regionsReached: number };
+  collision: { res: number; grid: 'bilinear'; changedCells: number };
+  fullControl?: ReshapeControlReport;
+  messages: string[];
+}
+
+export interface ReshapeOptions {
+  previous: PlayableSnapshot;
+  spec: LevelSpec;
+  label?: string;
+  blockCount?: number;
+  /** Expand the work window about the change centre (>1 recomputes more surrounding slope). */
+  editScale?: number;
+  /** Run a full one-shot build on the same constrained spec as a comparison control. */
+  runFullControl?: boolean;
+  /** Reuse an already computed full-control field (avoids paying for it twice in the UI). */
+  fullControl?: GenerationResult | null;
+}
+
 export interface CorridorSample {
   x: number;
   z: number;
@@ -306,6 +442,11 @@ export interface GenerationResult {
   passCenter: Vec2;
   locks: LockState;
   snapshotLabel?: string;
+  /** Replayable pipeline inputs, required to patch this level locally later. */
+  recipe?: GenerationRecipe;
+  datum?: TerrainDatum;
+  hydrology?: import('./hydrology').Hydrology;
+  reshape?: ReshapeReport | null;
 }
 
 export interface PlayableSnapshot {
@@ -327,6 +468,10 @@ export interface PlayableSnapshot {
   baseField: Float32Array;
   passCenter: Vec2;
   passWidth: PassWidthInfo;
+  recipe?: GenerationRecipe;
+  datum?: TerrainDatum;
+  /** Water state of the fine mesh, needed so a later local patch can reuse it. */
+  hydrology?: import('./hydrology').Hydrology;
 }
 
 export interface LevelPackage {

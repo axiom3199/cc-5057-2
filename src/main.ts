@@ -1,8 +1,9 @@
 import './ui/styles.css';
 import { createScene } from './render/scene';
 import { generateLevel, exportPackage, toSnapshot } from './core/generator';
+import { reshapeLevel, computeReshapeBounds, fullControl, applyReshapeEdits, type ReshapeEdits } from './core/reshape';
 import { LANDFORMS, SCENARIOS, scenarioById, specFromState, type DemoState } from './core/scenarios';
-import type { GenerationResult, LevelSpec, PlayableSnapshot, Vec2 } from './core/types';
+import type { GenerationResult, LevelSpec, PlayableSnapshot, ReshapeReport, Vec2 } from './core/types';
 
 const app = document.getElementById('app') as HTMLDivElement;
 
@@ -64,6 +65,34 @@ app.innerHTML = `
         <p id="snapshot-note" class="hint">先载入无断口底图并保存为「上一张可通关地图」，再点选断口场景即可测试修补与回退。</p>
       </section>
       <section class="group">
+        <h2>局部再塑形</h2>
+        <label class="field">
+          <span>山脊横移 <b id="ridge-offset-value">0 m</b></span>
+          <input id="ridge-offset" type="range" min="-60" max="60" step="2" value="0" />
+        </label>
+        <label class="field">
+          <span>通行走廊宽度 <b id="corridor-width-value"></b></span>
+          <input id="corridor-width" type="range" min="2.4" max="12" step="0.2" value="4.4" />
+        </label>
+        <label class="field">
+          <span>局部窗口倍率 <b id="edit-scale-value">1.0×</b></span>
+          <input id="edit-scale" type="range" min="1" max="2.5" step="0.1" value="1" />
+        </label>
+        <label class="field">
+          <span>通路绕行（横移） <b id="route-offset-value">0 m</b></span>
+          <input id="route-offset" type="range" min="-40" max="40" step="2" value="0" />
+        </label>
+        <div class="actions">
+          <button id="reshape" class="primary" type="button" disabled>局部重塑</button>
+          <button id="commit" type="button" disabled>采纳为可通关地图</button>
+        </div>
+        <div class="actions">
+          <button id="reset-reshape" type="button">复位改动</button>
+          <button id="compare-full" type="button" disabled>与完整生成对比</button>
+        </div>
+        <p id="reshape-note" class="hint">先「生成关卡」并在右侧面板保存为可通关地图，再拖动上方滑杆改变山脊、走廊或通路，点「局部重塑」只重算必要窗口。</p>
+      </section>
+      <section class="group">
         <h2>视图</h2>
         <div class="actions wrap">
           <button id="cam-overview" type="button">俯瞰</button>
@@ -95,6 +124,8 @@ app.innerHTML = `
         <span><i class="sw sw-fill"></i>填方</span>
         <span><i class="sw sw-water"></i>水系</span>
         <span><i class="sw sw-pin"></i>必达区</span>
+        <span><i class="sw sw-patch"></i>重塑窗口</span>
+        <span><i class="sw sw-frozen"></i>冻结区块</span>
       </div>
     </main>
 
@@ -118,6 +149,12 @@ app.innerHTML = `
       <section class="group">
         <h2>通行与降雨验收</h2>
         <div id="acceptance" class="acceptance"></div>
+      </section>
+      <section class="group">
+        <h2>局部重塑影响</h2>
+        <div id="reshape-report" class="reshape-report">
+          <p class="hint">尚未进行局部重塑。完成一次局部重塑后，这里列出补丁/冻结分块、受影响的坡面与路线、边界接缝、粗细网格一致度，以及无法连通时的可调整范围。</p>
+        </div>
       </section>
       <section class="group">
         <h2>修补候选</h2>
@@ -151,6 +188,13 @@ let savedSnapshot: PlayableSnapshot | null = null;
 let baseSpec: LevelSpec = scenarioById(state.scenarioId)!.build();
 let lastSpec: LevelSpec = baseSpec;
 let busy = false;
+
+/** The last applied reshape, so the author can review or commit it. */
+let lastReshape: { result: GenerationResult; previous: PlayableSnapshot; spec: LevelSpec } | null = null;
+
+/** Editor reshape knobs. `editScale` widens the window; the rest are authored spec edits. */
+type UiReshapeEdits = Required<ReshapeEdits> & { editScale: number };
+const reshapeEdits: UiReshapeEdits = { ridgeOffset: 0, corridorWidth: -1, editScale: 1, routeOffset: 0 };
 
 function scenarioList(): void {
   const host = $<HTMLDivElement>('scenario-list');
@@ -220,8 +264,11 @@ async function generate(): Promise<void> {
     const result = generateLevel(spec, { previous: savedSnapshot });
     current = result;
     lastSpec = spec;
+    lastReshape = null;
+    resetReshapeEdits();
     scene.setResult(result);
     renderResults(result);
+    renderReshapeReport(result.reshape ?? null);
     setStatus(result);
     $<HTMLSpanElement>('progress-value').textContent = '0%';
     $<HTMLInputElement>('progress').value = '0';
@@ -232,6 +279,148 @@ async function generate(): Promise<void> {
     busy = false;
     setBusy(false);
   }
+}
+
+/** The snapshot a local reshape should patch: the last committed playable map. */
+function reshapeBase(): PlayableSnapshot | null {
+  if (!savedSnapshot) return null;
+  if (!savedSnapshot.recipe || !savedSnapshot.datum) return null;
+  return savedSnapshot;
+}
+
+function resetReshapeEdits(): void {
+  reshapeEdits.ridgeOffset = 0;
+  reshapeEdits.corridorWidth = -1;
+  reshapeEdits.editScale = 1;
+  reshapeEdits.routeOffset = 0;
+  const width = (reshapeBase()?.spec ?? current?.spec ?? buildSpec()).corridor.width;
+  $<HTMLInputElement>('ridge-offset').value = '0';
+  $<HTMLInputElement>('route-offset').value = '0';
+  $<HTMLInputElement>('edit-scale').value = '1';
+  $<HTMLInputElement>('corridor-width').value = String(width);
+  updateReshapeLabels();
+  updateReshapeButtons();
+}
+
+function updateReshapeLabels(): void {
+  const base = current?.spec ?? buildSpec();
+  const width = reshapeEdits.corridorWidth < 0 ? base.corridor.width : reshapeEdits.corridorWidth;
+  $<HTMLSpanElement>('ridge-offset-value').textContent = `${reshapeEdits.ridgeOffset > 0 ? '+' : ''}${reshapeEdits.ridgeOffset.toFixed(0)} m`;
+  $<HTMLSpanElement>('corridor-width-value').textContent = `${width.toFixed(1)} m`;
+  $<HTMLSpanElement>('route-offset-value').textContent = `${reshapeEdits.routeOffset > 0 ? '+' : ''}${reshapeEdits.routeOffset.toFixed(0)} m`;
+  $<HTMLSpanElement>('edit-scale-value').textContent = `${reshapeEdits.editScale.toFixed(1)}×`;
+}
+
+function updateReshapeButtons(): void {
+  const snap = reshapeBase();
+  $<HTMLButtonElement>('reshape').disabled = busy || !snap;
+  $<HTMLButtonElement>('compare-full').disabled = busy || !lastReshape || lastReshape.result.reshape?.rolledBack === true;
+  $<HTMLButtonElement>('commit').disabled = busy || !lastReshape || lastReshape.result.reshape?.rolledBack === true;
+}
+
+/** Build the edited spec from the last committed map's spec so retries never compound. */
+function editedSpec(): LevelSpec {
+  const base = reshapeBase()?.spec ?? current?.spec ?? lastSpec;
+  return applyReshapeEdits(base, {
+    ridgeOffset: reshapeEdits.ridgeOffset,
+    corridorWidth: reshapeEdits.corridorWidth,
+    routeOffset: reshapeEdits.routeOffset,
+  });
+}
+
+async function reshape(): Promise<void> {
+  if (busy) return;
+  const previous = reshapeBase();
+  if (!previous) {
+    $<HTMLParagraphElement>('reshape-note').textContent = '需要先保存一张带重放配方的可通关地图（点「保存为可通关地图」），才能局部重塑。';
+    return;
+  }
+  busy = true;
+  setBusy(true);
+  $<HTMLButtonElement>('reshape').textContent = '重塑中…';
+  try {
+    await frame();
+    const spec = editedSpec();
+    const result = reshapeLevel({ previous, spec, label: `reshape-${previous.label}`, editScale: reshapeEdits.editScale, runFullControl: false });
+    current = result;
+    lastSpec = spec;
+    lastReshape = { result, previous, spec };
+    scene.setResult(result);
+    renderResults(result);
+    renderReshapeReport(result.reshape ?? null);
+    setStatus(result);
+    const report = result.reshape;
+    const note = $<HTMLParagraphElement>('reshape-note');
+    if (report) {
+      const bounds = computeReshapeBounds(previous.spec, spec, { editScale: reshapeEdits.editScale });
+      const span = `${bounds.minX.toFixed(0)}…${bounds.maxX.toFixed(0)} × ${bounds.minZ.toFixed(0)}…${bounds.maxZ.toFixed(0)} m`;
+      if (report.rolledBack) {
+        note.textContent = `改动与约束冲突，已整体撤回，保留「${previous.label}」。可在右侧「局部重塑影响」查看冲突与可调整范围。建议窗口 ${span}。`;
+        note.classList.remove('ok');
+      } else {
+        note.textContent = `已局部重塑 ${span}：补丁 ${report.patchedCells} 顶点、冻结 ${report.frozenCells} 顶点，边界 ${report.seam.maxStep.toFixed(2)} m，粗细一致度 ${(report.lod.finalAgreement * 100).toFixed(0)}%。`;
+        note.classList.add('ok');
+      }
+    }
+    updateReshapeButtons();
+  } catch (err) {
+    console.error(err);
+    $<HTMLDivElement>('log').innerHTML = `<p class="err">局部重塑失败：${String(err)}</p>`;
+  } finally {
+    busy = false;
+    setBusy(false);
+    $<HTMLButtonElement>('reshape').textContent = '局部重塑';
+  }
+}
+
+/** Compare the local result with a full one-shot generation of the same edited spec. */
+async function compareWithFull(): Promise<void> {
+  if (!lastReshape || busy) return;
+  if (lastReshape.result.reshape?.rolledBack) {
+    $<HTMLParagraphElement>('reshape-note').textContent = '本次改动已整体撤回，没有可对比的局部结果；请先调整改动让局部重塑通过。';
+    $<HTMLParagraphElement>('reshape-note').classList.remove('ok');
+    return;
+  }
+  const { result, spec } = lastReshape;
+  busy = true;
+  setBusy(true);
+  try {
+    await frame();
+    // Re-run the reshape with the control build attached, so the report can quantify agreement.
+    const control = fullControl(spec);
+    const rerun = reshapeLevel({ previous: lastReshape.previous, spec, label: `reshape-${lastReshape.previous.label}`, editScale: reshapeEdits.editScale, runFullControl: true, fullControl: control });
+    if (rerun.reshape) {
+      result.reshape = rerun.reshape;
+      renderReshapeReport(rerun.reshape);
+      const c = rerun.reshape.fullControl;
+      if (c) {
+        $<HTMLParagraphElement>('reshape-note').textContent = `与完整生成对比：完整生成 ${statusLabel(c.status)}，最大坡度 ${(Math.atan(c.maxGrade) * 180 / Math.PI).toFixed(1)}°，最小净宽 ${c.minNetWidth.toFixed(2)} m；两套地形最大高差 ${c.maxFieldDelta.toFixed(2)} m、平均 ${c.meanFieldDelta.toFixed(2)} m。`;
+        $<HTMLParagraphElement>('reshape-note').classList.add('ok');
+      }
+    }
+  } catch (err) {
+    console.error(err);
+  } finally {
+    busy = false;
+    setBusy(false);
+    updateReshapeButtons();
+  }
+}
+
+function commitReshape(): void {
+  if (!lastReshape || lastReshape.result.reshape?.rolledBack) return;
+  const snap = toSnapshot(lastReshape.result, `reshape-${lastReshape.previous.label}`);
+  if (!snap) {
+    $<HTMLParagraphElement>('reshape-note').textContent = '局部重塑结果未通过验收，不能采纳为可通关地图。';
+    return;
+  }
+  savedSnapshot = snap;
+  const note = $<HTMLParagraphElement>('snapshot-note');
+  note.textContent = `已采纳「${snap.label}」为新的可通关地图；后续局部重塑都基于它冻结远端地形。`;
+  note.classList.add('ok');
+  $<HTMLParagraphElement>('reshape-note').textContent = `已采纳本次局部重塑为「${snap.label}」。继续拖动滑杆可在其基础上迭代替换。`;
+  $<HTMLParagraphElement>('reshape-note').classList.add('ok');
+  updateReshapeButtons();
 }
 
 function frame(): Promise<void> {
@@ -259,6 +448,7 @@ function setBusy(on: boolean): void {
   $<HTMLButtonElement>('generate').disabled = on;
   $<HTMLButtonElement>('generate').textContent = on ? '生成中…' : '生成关卡';
   sceneHost.classList.toggle('busy', on);
+  updateReshapeButtons();
 }
 
 function setStatus(result: GenerationResult): void {
@@ -354,6 +544,85 @@ function renderResults(result: GenerationResult): void {
   $<HTMLDivElement>('log').innerHTML = result.messages.map((m2) => `<p>${escapeHtml(m2)}</p>`).join('');
 }
 
+function renderReshapeReport(report: ReshapeReport | null): void {
+  const host = $<HTMLDivElement>('reshape-report');
+  if (!report) {
+    host.innerHTML = `<p class="hint">尚未进行局部重塑。完成一次局部重塑后，这里列出补丁/冻结分块、受影响的坡面与路线、边界接缝、粗细网格一致度，以及无法连通时的可调整范围。</p>`;
+    return;
+  }
+  const mode = report.rolledBack ? '已撤回' : '局部更新';
+  const bounds = report.bounds
+    ? `${report.bounds.minX.toFixed(0)}…${report.bounds.maxX.toFixed(0)} × ${report.bounds.minZ.toFixed(0)}…${report.bounds.maxZ.toFixed(0)} m`
+    : '—';
+  const patchedBlocks = report.blocks.filter((b) => b.mode === 'patched').length;
+  const frozenBlocks = report.blocks.length - patchedBlocks;
+  const affected: string[] = [];
+  if (report.affected.ridges.length) affected.push(`山脊 ${report.affected.ridges.join('、')}`);
+  if (report.affected.basins.length) affected.push(`盆地 ${report.affected.basins.join('、')}`);
+  if (report.affected.regions.length) affected.push(`必达区 ${report.affected.regions.join('、')}`);
+  if (report.affected.river) affected.push('河道/水系');
+  if (report.affected.corridor) affected.push('通行走廊');
+  if (report.affected.pass) affected.push('山口');
+  affected.push('细化网格', '碰撞网格', '导航图');
+
+  const routeRows = report.routes
+    .map(
+      (r) => `<div class="diff ${r.changed ? 'changed' : ''} ${r.reachedAfter ? 'ok' : 'bad'}">
+        <b>${escapeHtml(r.name)}</b>
+        <span>${r.reachedBefore ? '已抵达' : '未达'} → ${r.reachedAfter ? '已抵达' : '未达'}</span>
+        <small>坡度 ${(Math.atan(r.maxGradeBefore) * 180 / Math.PI).toFixed(1)}° → ${(Math.atan(r.maxGradeAfter) * 180 / Math.PI).toFixed(1)}° · 长度 ${r.lengthBefore.toFixed(0)} → ${r.lengthAfter.toFixed(0)} m</small>
+      </div>`,
+    )
+    .join('');
+  const cr = report.corridorRoute;
+  const corridorRow = `<div class="diff ${cr.changed ? 'changed' : ''}">
+    <b>作者通路</b>
+    <span>${cr.changed ? '已更新' : '未变化'}</span>
+    <small>坡度 ${(Math.atan(cr.maxGradeBefore) * 180 / Math.PI).toFixed(1)}° → ${(Math.atan(cr.maxGradeAfter) * 180 / Math.PI).toFixed(1)}° · 净宽 ${cr.minWidthBefore.toFixed(2)} → ${cr.minWidthAfter.toFixed(2)} m</small>
+  </div>`;
+
+  const conflictRows = report.conflicts
+    .map(
+      (c) => `<div class="conflict ${c.kind === 'lod' || c.kind === 'seam' ? 'warn' : 'bad'}">
+        <b>${escapeHtml(c.label)}</b>
+        <small>${escapeHtml(c.detail)}</small>
+        <div class="adjustable">${c.adjustable
+          .map(
+            (a) => `<span class="adj" title="${escapeHtml(a.note)}">${escapeHtml(a.label)} ${a.min.toFixed(1)}–${a.max.toFixed(1)}${a.unit} · 建议 ${a.suggested.toFixed(1)}${a.unit}</span>`,
+          )
+          .join('')}</div>
+      </div>`,
+    )
+    .join('');
+
+  const control = report.fullControl
+    ? `<div class="reshape-control">
+        <b>完整生成对照</b>
+        <small>状态 ${statusLabel(report.fullControl.status)} · 坡度 ${(Math.atan(report.fullControl.maxGrade) * 180 / Math.PI).toFixed(1)}° · 净宽 ${report.fullControl.minNetWidth.toFixed(2)} m · 与局部地形最大高差 ${report.fullControl.maxFieldDelta.toFixed(2)} m / 平均 ${report.fullControl.meanFieldDelta.toFixed(2)} m</small>
+      </div>`
+    : '';
+
+  host.innerHTML = `
+    <div class="reshape-head ${report.rolledBack ? 'bad' : 'ok'}">
+      <b>${mode}</b>
+      <span>${escapeHtml(report.label)}</span>
+    </div>
+    <div class="reshape-facts">
+      <div><span>重算窗口</span><b>${bounds}</b></div>
+      <div><span>分块</span><b>补丁 ${patchedBlocks} · 冻结 ${frozenBlocks}</b></div>
+      <div><span>顶点</span><b>${report.patchedCells} 改动 / ${report.frozenCells} 保持</b></div>
+      <div><span>边界接缝</span><b>${report.seam.maxStep.toFixed(2)} m · ${report.seam.maxSlopeDeg.toFixed(1)}°</b></div>
+      <div><span>粗细一致度</span><b>${(report.lod.finalAgreement * 100).toFixed(0)}%（粗 ${report.lod.coarseRes}² / 细 ${report.lod.fineRes}²）</b></div>
+      <div><span>导航 / 碰撞</span><b>${report.navigation.regionsReached}/${report.routes.length} 必达 · 碰撞 ${report.collision.res}² ${report.collision.grid}</b></div>
+      <div><span>用时</span><b>${report.patchMs.toFixed(0)} ms 补丁 / ${report.elapsedMs.toFixed(0)} ms 合计</b></div>
+    </div>
+    <div class="reshape-section">受影响层：${affected.map((a) => `<span class="tag">${escapeHtml(a)}</span>`).join('')}</div>
+    <div class="reshape-section"><h3>路线变化</h3>${corridorRow}${routeRows}</div>
+    ${report.conflicts.length ? `<div class="reshape-section"><h3>冲突与可调整范围</h3>${conflictRows}</div>` : ''}
+    ${control}
+  `;
+}
+
 function repairLabel(k: string): string {
   return ({ 'reroute-trail': '移走走廊（保水系）', 'raise-pass': '填坡改道（保旧山口）', rollback: '回退到上一张地图', none: '无需修补', failed: '未修补' } as Record<string, string>)[k] ?? k;
 }
@@ -382,6 +651,7 @@ function saveSnapshot(): void {
     note.textContent = '当前地图未通过验收，不能保存为可通关地图。请先修正生成参数。';
     note.classList.remove('ok');
   }
+  updateReshapeButtons();
 }
 
 function wireControls(): void {
@@ -420,6 +690,27 @@ function wireControls(): void {
   $<HTMLButtonElement>('generate').addEventListener('click', () => void generate());
   $<HTMLButtonElement>('snapshot').addEventListener('click', saveSnapshot);
   $<HTMLButtonElement>('load-base').addEventListener('click', () => void loadBaseMap());
+
+  $<HTMLInputElement>('ridge-offset').addEventListener('input', (e) => {
+    reshapeEdits.ridgeOffset = Number((e.target as HTMLInputElement).value);
+    updateReshapeLabels();
+  });
+  $<HTMLInputElement>('corridor-width').addEventListener('input', (e) => {
+    reshapeEdits.corridorWidth = Number((e.target as HTMLInputElement).value);
+    updateReshapeLabels();
+  });
+  $<HTMLInputElement>('edit-scale').addEventListener('input', (e) => {
+    reshapeEdits.editScale = Number((e.target as HTMLInputElement).value);
+    updateReshapeLabels();
+  });
+  $<HTMLInputElement>('route-offset').addEventListener('input', (e) => {
+    reshapeEdits.routeOffset = Number((e.target as HTMLInputElement).value);
+    updateReshapeLabels();
+  });
+  $<HTMLButtonElement>('reshape').addEventListener('click', () => void reshape());
+  $<HTMLButtonElement>('compare-full').addEventListener('click', () => void compareWithFull());
+  $<HTMLButtonElement>('commit').addEventListener('click', commitReshape);
+  $<HTMLButtonElement>('reset-reshape').addEventListener('click', resetReshapeEdits);
   $<HTMLButtonElement>('cam-overview').addEventListener('click', () => scene.setCameraPreset('overview'));
   $<HTMLButtonElement>('cam-trail').addEventListener('click', () => scene.setCameraPreset('trail'));
   $<HTMLButtonElement>('cam-regions').addEventListener('click', () => scene.setCameraPreset('regions'));
@@ -457,6 +748,7 @@ function wireControls(): void {
 scenarioList();
 syncInputs(buildSpec());
 wireControls();
+resetReshapeEdits();
 void generate();
 
 // Expose for automated browser verification.
@@ -464,10 +756,28 @@ declare global {
   interface Window {
     __RIDGELINE__?: {
       generate: () => Promise<void>;
+      reshape: (edits?: Partial<UiReshapeEdits>) => Promise<void>;
+      commit: () => void;
+      compare: () => Promise<void>;
       state: typeof state;
+      edits: UiReshapeEdits;
       result: () => GenerationResult | null;
+      reshapeResult: () => { result: GenerationResult; previous: PlayableSnapshot; spec: LevelSpec } | null;
       scene: typeof scene;
     };
   }
 }
-window.__RIDGELINE__ = { generate, state, result: () => current, scene };
+window.__RIDGELINE__ = {
+  generate,
+  reshape: async (edits) => {
+    if (edits) Object.assign(reshapeEdits, edits);
+    await reshape();
+  },
+  commit: commitReshape,
+  compare: compareWithFull,
+  state,
+  edits: reshapeEdits,
+  result: () => current,
+  reshapeResult: () => lastReshape,
+  scene,
+};
